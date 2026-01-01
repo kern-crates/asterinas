@@ -15,13 +15,16 @@ pub(crate) use self::allocator::IoMemAllocatorBuilder;
 pub(super) use self::allocator::init;
 use crate::{
     Error,
+    cpu::{AtomicCpuSet, CpuSet},
     mm::{
         HasPaddr, HasSize, Infallible, PAGE_SIZE, Paddr, PodOnce, VmReader, VmWriter,
         io_util::{HasVmReaderWriter, VmReaderWriterIdentity},
         kspace::kvirt_area::KVirtArea,
         page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
+        tlb::{TlbFlushOp, TlbFlusher},
     },
     prelude::*,
+    task::disable_preempt,
 };
 
 /// A marker type used for [`IoMem`],
@@ -93,17 +96,14 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
                 range.end,
             );
 
-            let num_pages = area_size / PAGE_SIZE;
             // SAFETY:
             //  - The range `first_page_start..last_page_end` is always page aligned.
             //  - FIXME: We currently do not limit the I/O memory allocator with the maximum GPA,
             //    so the address range may not fall in the GPA limit.
-            //  - FIXME: The I/O memory can be at a high address, so it may not be contained in the
-            //    linear mapping.
             //  - The caller guarantees that operations on the I/O memory do not have any side
             //    effects that may cause soundness problems, so the pages can safely be viewed as
             //    untyped memory.
-            unsafe { crate::arch::tdx_guest::unprotect_gpa_range(first_page_start, num_pages).unwrap() };
+            unsafe { crate::arch::tdx_guest::unprotect_gpa_tdvm_call(first_page_start, area_size).unwrap() };
 
             PrivilegedPageFlags::SHARED
         } else {
@@ -118,9 +118,19 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
             priv_flags,
         };
 
-        // SAFETY: The caller of `IoMem::new()` ensures that the given
-        // physical address range is I/O memory, so it is safe to map.
-        let kva = unsafe { KVirtArea::map_untracked_frames(area_size, 0, frames_range, prop) };
+        let kva = {
+            // SAFETY: The caller of `IoMem::new()` ensures that the given
+            // physical address range is I/O memory, so it is safe to map.
+            let kva = unsafe { KVirtArea::map_untracked_frames(area_size, 0, frames_range, prop) };
+
+            let target_cpus = AtomicCpuSet::new(CpuSet::new_full());
+            let mut flusher = TlbFlusher::new(&target_cpus, disable_preempt());
+            flusher.issue_tlb_flush(TlbFlushOp::for_range(kva.range()));
+            flusher.dispatch_tlb_flush();
+            flusher.sync_tlb_flush();
+
+            kva
+        };
 
         Self {
             kvirt_area: Arc::new(kva),
