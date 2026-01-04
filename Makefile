@@ -207,6 +207,8 @@ export
 NON_OSDK_CRATES := \
 	ostd/libs/align_ext \
 	ostd/libs/id-alloc \
+	ostd/libs/int-to-c-enum \
+	ostd/libs/int-to-c-enum/derive \
 	ostd/libs/linux-bzimage/builder \
 	ostd/libs/linux-bzimage/boot-params \
 	ostd/libs/ostd-macros \
@@ -215,14 +217,11 @@ NON_OSDK_CRATES := \
 	kernel/libs/aster-rights-proc \
 	kernel/libs/atomic-integer-wrapper \
 	kernel/libs/cpio-decoder \
-	kernel/libs/int-to-c-enum \
-	kernel/libs/int-to-c-enum/derive \
 	kernel/libs/jhash \
 	kernel/libs/keyable-arc \
 	kernel/libs/logo-ascii-art \
 	kernel/libs/typeflags \
-	kernel/libs/typeflags-util \
-	tools/sctrace
+	kernel/libs/typeflags-util
 
 # In contrast, OSDK crates depend on OSTD (or being `ostd` itself)
 # and need to be built or tested with OSDK.
@@ -274,7 +273,9 @@ $(CARGO_OSDK): $(OSDK_SRC_FILES)
 
 .PHONY: check_osdk
 check_osdk:
-	@cd osdk && cargo clippy -- -D warnings
+	@# Run clippy on OSDK with and without the test configuration.
+	@cd osdk && cargo clippy --no-deps -- -D warnings
+	@cd osdk && cargo clippy --tests --no-deps -- -D warnings
 
 .PHONY: test_osdk
 test_osdk:
@@ -330,7 +331,7 @@ iso:
 # Build the Asterinas NixOS ISO installer image and then do installation
 run_iso: OVMF = off
 run_iso:
-	@./tools/nixos/run_iso.sh
+	@./tools/nixos/run.sh iso
 
 # Create an Asterinas NixOS installation on host
 nixos: BOOT_PROTOCOL = linux-efi-handover64
@@ -342,7 +343,7 @@ nixos:
 # run the NixOS
 run_nixos: OVMF = off
 run_nixos:
-	@./tools/nixos/run_nixos.sh target/nixos
+	@./tools/nixos/run.sh nixos
 
 # Build the Asterinas NixOS patched packages
 cachix:
@@ -453,7 +454,9 @@ check: initramfs $(CARGO_OSDK)
 	@# Check compilation of the Rust code
 	@for dir in $(NON_OSDK_CRATES); do \
 		echo "Checking $$dir"; \
+		# Run clippy on each crate with and without the test configuration. \
 		(cd $$dir && cargo clippy --no-deps -- -D warnings) || exit 1; \
+		(cd $$dir && cargo clippy --tests --no-deps -- -D warnings) || exit 1; \
 	done
 	@for dir in $(OSDK_CRATES); do \
 		echo "Checking $$dir"; \
@@ -462,7 +465,7 @@ check: initramfs $(CARGO_OSDK)
 		[ "$$dir" = "ostd/libs/linux-bzimage/setup" ] && [ "$(OSDK_TARGET_ARCH)" != "x86_64" ] && continue; \
 		# Run clippy on each crate with and without the ktest configuration. \
 		(cd $$dir && cargo osdk clippy -- --no-deps -- -D warnings) || exit 1; \
-		(cd $$dir && cargo osdk clippy --ktest -- --no-deps -- -D warnings) || exit 1; \
+		(cd $$dir && cargo osdk clippy --ktests -- --no-deps -- -D warnings) || exit 1; \
 	done
 	@
 	@# Check formatting issues of the C code and Nix files (regression tests)
