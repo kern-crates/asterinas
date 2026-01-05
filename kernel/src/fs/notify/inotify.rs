@@ -6,17 +6,14 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
-    any::Any,
     fmt::Display,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
+use align_ext::AlignExt;
 use bitflags::bitflags;
 use hashbrown::HashMap;
-use ostd::{
-    mm::VmWriter,
-    sync::{Mutex, SpinLock},
-};
+use ostd::{mm::VmWriter, sync::SpinLock};
 
 use crate::{
     events::IoEvents,
@@ -37,25 +34,25 @@ use crate::{
 #[derive(Clone)]
 struct SubscriberEntry {
     inode: Weak<dyn Inode>,
-    subscriber: Weak<dyn FsEventSubscriber>,
+    subscriber: Weak<InotifySubscriber>,
 }
 
 /// A file-like object that provides inotify functionality.
 ///
-/// InotifyFile accepts events from multiple inotify subscribers (watches) on different inodes.
+/// `InotifyFile` accepts events from multiple inotify subscribers (watches) on different inodes.
 /// Users should read events from this file to receive notifications about filesystem changes.
 pub struct InotifyFile {
-    // Lock to serialize watch updates and removals.
-    watch_lock: Mutex<()>,
-    // Next watch descriptor to allocate.
+    // The next watch descriptor to allocate.
     next_wd: AtomicU32,
-    // A map from watch descriptor to subscriber entry.
-    watch_map: RwLock<HashMap<u32, SubscriberEntry>>,
+    // A map from watch descriptors to subscriber entries.
+    watch_map: SpinLock<HashMap<u32, SubscriberEntry>>,
+    // A mutex to synchronize `read()` operations.
+    read_mutex: Mutex<()>,
     // Whether the file is opened in non-blocking mode.
     is_nonblocking: AtomicBool,
-    // Bounded queue of inotify events.
+    // A bounded queue of inotify events.
     event_queue: SpinLock<VecDeque<InotifyEvent>>,
-    // Maximum capacity of the event queue.
+    // The maximum capacity of the event queue.
     queue_capacity: usize,
     // A pollable object for this inotify file.
     pollee: Pollee,
@@ -65,10 +62,12 @@ pub struct InotifyFile {
 
 impl Drop for InotifyFile {
     /// Cleans up all subscribers when the inotify file is dropped.
+    ///
     /// This will remove all subscribers from their inodes.
     fn drop(&mut self) {
-        let mut watch_map = self.watch_map.write();
-        for (_, entry) in watch_map.iter() {
+        let watch_map = self.watch_map.get_mut();
+
+        for (_, entry) in watch_map.drain() {
             let (Some(inode), Some(subscriber)) =
                 (entry.inode.upgrade(), entry.subscriber.upgrade())
             else {
@@ -78,30 +77,28 @@ impl Drop for InotifyFile {
             if inode
                 .fs_event_publisher()
                 .unwrap()
-                .remove_subscriber(&subscriber)
+                .remove_subscriber(&(subscriber as _))
             {
                 inode.fs().fs_event_subscriber_stats().remove_subscriber();
             }
         }
-        watch_map.clear();
     }
 }
 
-/// Default max queued events.
+/// The default maximum capacity of the event queue.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v6.14/source/fs/notify/inotify/inotify_user.c#L853>
 const DEFAULT_MAX_QUEUED_EVENTS: usize = 16384;
 
 impl InotifyFile {
     /// Creates a new inotify file.
-    ///
-    /// Watch Description starts from 1.
-    /// Reference: <https://elixir.bootlin.com/linux/v6.17/source/fs/notify/inotify/inotify_user.c#L402>
     pub fn new(is_nonblocking: bool) -> Result<Arc<Self>> {
         Ok(Arc::new_cyclic(|weak_self| Self {
-            watch_lock: Mutex::new(()),
+            // Allocate watch descriptors from 1.
+            // Reference: <https://elixir.bootlin.com/linux/v6.17/source/fs/notify/inotify/inotify_user.c#L402>
             next_wd: AtomicU32::new(1),
-            watch_map: RwLock::new(HashMap::new()),
+            watch_map: SpinLock::new(HashMap::new()),
+            read_mutex: Mutex::new(()),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             event_queue: SpinLock::new(VecDeque::new()),
             queue_capacity: DEFAULT_MAX_QUEUED_EVENTS,
@@ -116,9 +113,9 @@ impl InotifyFile {
 
         let new_wd = self.next_wd.fetch_add(1, Ordering::Relaxed);
         if new_wd > MAX_VALID_WD {
-            // Rollback the allocation if we exceeded the limit
+            // Roll back the allocation if we exceed the limit.
             self.next_wd.fetch_sub(1, Ordering::Relaxed);
-            return_errno_with_message!(Errno::ENOSPC, "Inotify watches limit reached");
+            return_errno_with_message!(Errno::ENOSPC, "the inotify watch limit is reached");
         }
         Ok(new_wd)
     }
@@ -133,136 +130,100 @@ impl InotifyFile {
         interesting: InotifyEvents,
         options: InotifyControls,
     ) -> Result<u32> {
-        // Serialize updates so concurrent callers do not create duplicate watches.
-        let _guard = self.watch_lock.lock();
+        let mut watch_map = self.watch_map.lock();
 
-        // Try to update existing subscriber first
-        match self.update_existing_subscriber(path, interesting, options) {
-            Ok(wd) => Ok(wd),
-            Err(e) if e.error() == Errno::ENOENT => {
-                // Subscriber not found, create a new one
-                self.create_new_subscriber(path, interesting, options)
+        // Try to find and update the existing subscriber first.
+        let inode_weak = Arc::downgrade(path.inode());
+        for (wd, entry) in watch_map.iter() {
+            if !Weak::ptr_eq(&entry.inode, &inode_weak) {
+                continue;
             }
-            Err(e) => Err(e),
+
+            // The inode has been unlinked and the subscriber is dead. We shouldn't need to update
+            // since no new events can occur.
+            let Some(subscriber) = entry.subscriber.upgrade() else {
+                return Ok(*wd);
+            };
+
+            subscriber.update(interesting, options)?;
+            path.inode()
+                .fs_event_publisher()
+                .unwrap()
+                .update_subscriber_events();
+
+            return Ok(*wd);
         }
+
+        // Create a new subscriber and register it.
+
+        let inotify_subscriber = InotifySubscriber::new(self.this(), interesting, options)?;
+        let subscriber = inotify_subscriber.clone() as Arc<dyn FsEventSubscriber>;
+
+        let inode = path.inode();
+        if inode
+            .fs_event_publisher_or_init()
+            .add_subscriber(subscriber)
+        {
+            inode.fs().fs_event_subscriber_stats().add_subscriber();
+        }
+
+        let wd = inotify_subscriber.wd();
+        let entry = SubscriberEntry {
+            inode: inode_weak,
+            subscriber: Arc::downgrade(&inotify_subscriber),
+        };
+        watch_map.insert(wd, entry);
+
+        Ok(wd)
     }
 
     /// Removes a watch by watch descriptor.
     pub fn remove_watch(&self, wd: u32) -> Result<()> {
-        let _guard = self.watch_lock.lock();
+        let mut watch_map = self.watch_map.lock();
 
-        let mut watch_map = self.watch_map.write();
         let Some(entry) = watch_map.remove(&wd) else {
-            return_errno_with_message!(Errno::EINVAL, "watch not found");
+            return_errno_with_message!(Errno::EINVAL, "the inotify watch does not exist");
         };
 
-        // When concurrent removal happens, the weak refs may have already been dropped.
-        // Try to upgrade the weak refs; if either side is gone, treat as already removed.
         let (inode, subscriber) = match (entry.inode.upgrade(), entry.subscriber.upgrade()) {
-            (Some(i), Some(s)) => (i, s),
-            _ => return_errno_with_message!(Errno::EINVAL, "watch not found"),
+            (Some(inode), Some(subscriber)) => (inode, subscriber),
+            // The inode has been unlinked and the subscriber is dead. The watch is considered
+            // removed, so we return an error.
+            _ => return_errno_with_message!(Errno::EINVAL, "the inotify watch does not exist"),
         };
 
         if inode
             .fs_event_publisher()
             .unwrap()
-            .remove_subscriber(&subscriber)
+            .remove_subscriber(&(subscriber as _))
         {
             inode.fs().fs_event_subscriber_stats().remove_subscriber();
         }
+
         Ok(())
     }
 
-    /// Updates an existing inotify subscriber.
-    fn update_existing_subscriber(
-        &self,
-        path: &Path,
-        interesting: InotifyEvents,
-        options: InotifyControls,
-    ) -> Result<u32> {
-        let Some(publisher) = path.inode().fs_event_publisher() else {
-            return_errno_with_message!(Errno::ENOENT, "watch not found");
-        };
-        let inotify_file = self.this();
-
-        let result = publisher.find_subscriber_and_process(|subscriber| {
-            // Try to downcast to InotifySubscriber and check if it belongs to this InotifyFile.
-            let inotify_subscriber =
-                (subscriber.as_ref() as &dyn Any).downcast_ref::<InotifySubscriber>()?;
-
-            if Arc::ptr_eq(&inotify_subscriber.inotify_file(), &inotify_file) {
-                // Found the matching subscriber, perform the update in place.
-                Some(inotify_subscriber.update(interesting, options))
-            } else {
-                None
-            }
-        });
-
-        if let Some(result) = result {
-            // Notify publisher to recalculate aggregated events after subscriber update.
-            publisher.update_subscriber_events();
-            return result;
-        }
-
-        // If the subscriber is not found, return ENOENT.
-        return_errno_with_message!(Errno::ENOENT, "watch not found");
-    }
-
-    /// Creates a new FS event subscriber and activates it.
-    fn create_new_subscriber(
-        &self,
-        path: &Path,
-        interesting: InotifyEvents,
-        options: InotifyControls,
-    ) -> Result<u32> {
-        let inotify_subscriber = InotifySubscriber::new(self.this(), interesting, options)?;
-        let subscriber = inotify_subscriber.clone() as Arc<dyn FsEventSubscriber>;
-
-        if path
-            .inode()
-            .fs_event_publisher_or_init()
-            .add_subscriber(subscriber.clone())
-        {
-            path.inode()
-                .fs()
-                .fs_event_subscriber_stats()
-                .add_subscriber();
-        }
-
-        let wd = inotify_subscriber.wd();
-        self.watch_map.write().insert(
-            wd,
-            SubscriberEntry {
-                inode: Arc::downgrade(path.inode()),
-                subscriber: Arc::downgrade(&subscriber),
-            },
-        );
-
-        Ok(wd)
-    }
-
     /// Sends an inotify event to the inotify file.
+    ///
     /// The event will be queued and can be read by users.
     /// If the event can be merged with the last event in the queue, it will be merged.
     /// The event is only queued if it matches one of the subscriber's interesting events.
     fn receive_event(&self, subscriber: &InotifySubscriber, event: FsEvents, name: Option<String>) {
-        let wd = subscriber.wd();
         if !event.contains(FsEvents::IN_IGNORED) && !subscriber.is_interesting(event) {
             return;
         }
 
+        let wd = subscriber.wd();
         let new_event = InotifyEvent::new(wd, event, 0, name);
 
-        {
+        'notify: {
             let mut event_queue = self.event_queue.lock();
             if let Some(last_event) = event_queue.back()
                 && can_merge_events(last_event, &new_event)
             {
                 event_queue.pop_back();
                 event_queue.push_back(new_event);
-                // New or merged event makes the file readable
-                self.pollee.notify(IoEvents::IN);
-                return;
+                break 'notify;
             }
 
             // If the queue is full, drop the event.
@@ -273,28 +234,35 @@ impl InotifyFile {
 
             event_queue.push_back(new_event);
         }
+        // The new event or the merged event makes the file readable.
         self.pollee.notify(IoEvents::IN);
     }
 
     /// Pops an event from the notification queue.
     fn pop_event(&self) -> Option<InotifyEvent> {
         let mut event_queue = self.event_queue.lock();
-        event_queue.pop_front()
+
+        let event = event_queue.pop_front();
+        // Invalidate when the queue is empty.
+        if event_queue.is_empty() {
+            self.pollee.invalidate();
+        }
+
+        event
     }
 
     /// Gets the total size of all events in the notification queue.
     fn get_all_event_size(&self) -> usize {
         let event_queue = self.event_queue.lock();
 
-        event_queue.iter().map(|event| event.get_size()).sum()
+        event_queue.iter().map(|event| event.total_size()).sum()
     }
 
     /// Tries to read events from the notification queue.
     fn try_read(&self, writer: &mut VmWriter) -> Result<usize> {
-        const HEADER_SIZE: usize = size_of::<InotifyEventHeader>();
-        if writer.avail() < HEADER_SIZE {
-            return_errno_with_message!(Errno::EINVAL, "buffer is too small");
-        }
+        // This ensures that we report continuous events even when the user program attempts to
+        // call `read()` concurrently.
+        let _guard = self.read_mutex.lock();
 
         let mut size = 0;
         let mut consumed_events = 0;
@@ -305,26 +273,30 @@ impl InotifyFile {
                     size += event_size;
                     consumed_events += 1;
                 }
-                Err(e) => {
+                Err(err) => {
+                    // This won't reorder events due to `_guard`.
                     self.event_queue.lock().push_front(event);
                     if consumed_events == 0 {
-                        return Err(e);
+                        return Err(err);
                     }
-                    break;
+                    return Ok(size);
                 }
             }
         }
 
         if consumed_events == 0 {
-            return_errno_with_message!(Errno::EAGAIN, "no inotify events available");
+            return_errno_with_message!(Errno::EAGAIN, "no inotify events are available");
         }
 
-        // Only invalidate if the queue is empty after reading
-        let queue_empty = self.event_queue.lock().is_empty();
-        if queue_empty {
-            self.pollee.invalidate();
-        }
         Ok(size)
+    }
+
+    fn check_io_events(&self) -> IoEvents {
+        if self.event_queue.lock().is_empty() {
+            IoEvents::empty()
+        } else {
+            IoEvents::IN
+        }
     }
 
     fn this(&self) -> Arc<InotifyFile> {
@@ -334,13 +306,8 @@ impl InotifyFile {
 
 impl Pollable for InotifyFile {
     fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
-        self.pollee.poll_with(mask, poller, || {
-            if self.event_queue.lock().is_empty() {
-                IoEvents::empty()
-            } else {
-                IoEvents::IN
-            }
-        })
+        self.pollee
+            .poll_with(mask, poller, || self.check_io_events())
     }
 }
 
@@ -410,7 +377,7 @@ impl FileLike for InotifyFile {
                 writeln!(f, "mnt_id:\t{}", RESERVED_MOUNT_ID)?;
                 writeln!(f, "ino:\t{}", self.inner.inode().ino())?;
 
-                for (wd, entry) in self.inner.watch_map.read().iter() {
+                for (wd, entry) in self.inner.watch_map.lock().iter() {
                     let Some(inode) = entry.inode.upgrade() else {
                         continue;
                     };
@@ -421,7 +388,7 @@ impl FileLike for InotifyFile {
                     let sdev = inode.fs().sb().fsid;
                     writeln!(
                         f,
-                        "inotify wd:{} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0 fhandle-bytes:0 fhandle-type:0 f_handle:0",
+                        "inotify wd:{} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0",
                         wd,
                         inode.ino(),
                         sdev,
@@ -441,13 +408,13 @@ impl FileLike for InotifyFile {
 }
 
 /// Checks if the event type is mergeable.
-fn is_mergeable_event_type(event: FsEvents) -> bool {
-    event & (FsEvents::MODIFY | FsEvents::ATTRIB | FsEvents::ACCESS) != FsEvents::empty()
+fn is_mergeable_event_type(event: u32) -> bool {
+    event & (FsEvents::MODIFY | FsEvents::ATTRIB | FsEvents::ACCESS).bits() != 0
 }
 
 /// Checks if two inotify events can be merged.
 fn can_merge_events(existing: &InotifyEvent, new_event: &InotifyEvent) -> bool {
-    existing.wd() == new_event.wd()
+    existing.header.wd == new_event.header.wd
         && existing.name == new_event.name
         && existing.header.event == new_event.header.event
         && is_mergeable_event_type(new_event.header.event)
@@ -461,18 +428,19 @@ fn can_merge_events(existing: &InotifyEvent, new_event: &InotifyEvent) -> bool {
 /// `AtomicU64` for atomic updates: the high 32 bits store options, and the low 32 bits
 /// store the event mask.
 pub struct InotifySubscriber {
-    // interesting events and control options.
+    // Interesting events and control options.
+    //
+    // This field is packed into a `u64`: the high 32 bits store options,
+    // and the low 32 bits store interesting events.
     interesting_and_controls: AtomicU64,
     // Watch descriptor.
     wd: u32,
-    // reference to the owning inotify file.
+    // Reference to the owning inotify file.
     inotify_file: Arc<InotifyFile>,
 }
 
 impl InotifySubscriber {
-    /// Creates a new InotifySubscriber with initial interesting events and options.
-    /// The `interesting_and_controls` field is packed into a u64: the high 32 bits store options,
-    /// and the low 32 bits store interesting events.
+    /// Creates a new `InotifySubscriber` with initial interesting events and options.
     pub fn new(
         inotify_file: Arc<InotifyFile>,
         interesting: InotifyEvents,
@@ -484,7 +452,7 @@ impl InotifySubscriber {
             wd,
             inotify_file,
         });
-        // Initialize the interesting_and_controls atomically
+        // Initialize the `interesting_and_controls` field.
         this.update_interesting_and_controls(interesting.bits(), options.bits());
         Ok(this)
     }
@@ -503,14 +471,14 @@ impl InotifySubscriber {
         InotifyControls::from_bits_truncate((flags >> 32) as u32)
     }
 
-    pub fn inotify_file(&self) -> Arc<InotifyFile> {
-        self.inotify_file.clone()
+    pub fn inotify_file(&self) -> &Arc<InotifyFile> {
+        &self.inotify_file
     }
 
-    /// Updates the interesting events and options atomically using a CAS (Compare-And-Swap) loop.
-    fn update(&self, interesting: InotifyEvents, options: InotifyControls) -> Result<u32> {
+    /// Updates the interesting events and options atomically.
+    fn update(&self, interesting: InotifyEvents, options: InotifyControls) -> Result<()> {
         if options.contains(InotifyControls::MASK_CREATE) {
-            return_errno_with_message!(Errno::EEXIST, "watch already exists");
+            return_errno_with_message!(Errno::EEXIST, "the inotify watch already exists");
         }
 
         let mut merged_interesting = interesting;
@@ -523,10 +491,11 @@ impl InotifySubscriber {
         merged_options.remove(InotifyControls::MASK_ADD);
 
         self.update_interesting_and_controls(merged_interesting.bits(), merged_options.bits());
-        Ok(self.wd())
+
+        Ok(())
     }
 
-    /// Atomically updates the interesting events and options using a CAS loop to ensure consistency.
+    /// Updates the interesting events and options atomically with raw bits.
     fn update_interesting_and_controls(&self, new_interesting: u32, new_options: u32) {
         let new_flags = ((new_options as u64) << 32) | (new_interesting as u64);
         self.interesting_and_controls
@@ -561,102 +530,72 @@ struct InotifyEvent {
 
 /// The header of an inotify event.
 ///
-/// see <https://elixir.bootlin.com/linux/v6.17.8/source/include/uapi/linux/inotify.h#L21>
+/// Reference: <https://elixir.bootlin.com/linux/v6.17.8/source/include/uapi/linux/inotify.h#L21>
 #[repr(C)]
+#[derive(Clone, Copy, Pod)]
 struct InotifyEventHeader {
     wd: u32,
-    event: FsEvents,
+    event: u32,
     cookie: u32,
     name_len: u32,
 }
 
 impl InotifyEvent {
     fn new(wd: u32, event: FsEvents, cookie: u32, name: Option<String>) -> Self {
-        // Calculate actual name length including null terminator
+        // Calculate the actual name length including the null terminator.
         let actual_name_len = name.as_ref().map_or(0, |name| name.len() + 1);
-        // Calculate padded name length aligned to sizeof(struct inotify_event)
+        // Calculate the padded name length aligned to `size_of::<InotifyEventHeader>`.
         let pad_name_len = Self::round_event_name_len(actual_name_len);
 
-        Self {
-            header: InotifyEventHeader {
-                wd,
-                event,
-                cookie,
-                name_len: pad_name_len as u32,
-            },
-            name,
-        }
+        let header = InotifyEventHeader {
+            wd,
+            event: event.bits(),
+            cookie,
+            name_len: pad_name_len as u32,
+        };
+        Self { header, name }
     }
 
-    fn wd(&self) -> u32 {
-        self.header.wd
-    }
-
-    fn event(&self) -> FsEvents {
-        self.header.event
-    }
-
-    fn cookie(&self) -> u32 {
-        self.header.cookie
-    }
-
-    fn name_len(&self) -> u32 {
-        self.header.name_len
-    }
-}
-
-impl InotifyEvent {
-    /// Rounds up the name length to align with sizeof(struct inotify_event).
+    /// Rounds up the name length to align with `size_of::<InotifyEventHeader>()`.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v6.17.8/source/fs/notify/inotify/inotify_user.c#L160>
     fn round_event_name_len(name_len: usize) -> usize {
-        const INOTIFY_EVENT_SIZE: usize = size_of::<InotifyEventHeader>();
-        (name_len + INOTIFY_EVENT_SIZE - 1) & !(INOTIFY_EVENT_SIZE - 1)
+        const HEADER_SIZE: usize = size_of::<InotifyEventHeader>(); // 16 bytes
+        const { assert!(HEADER_SIZE.is_power_of_two()) };
+        name_len.align_up(HEADER_SIZE)
+    }
+
+    fn total_size(&self) -> usize {
+        const HEADER_SIZE: usize = size_of::<InotifyEventHeader>(); // 16 bytes
+        HEADER_SIZE + (self.header.name_len as usize)
     }
 
     fn copy_to_user(&self, writer: &mut VmWriter) -> Result<usize> {
-        let mut total_size = 0;
-
-        // Calculate actual name length including null terminator
-        let actual_name_len = self.name.as_ref().map_or(0, |name| name.len() + 1);
-        // Calculate padded name length aligned to sizeof(struct inotify_event)
-        let pad_name_len = Self::round_event_name_len(actual_name_len);
-
-        // Write the event header
-        writer.write_val(&self.wd())?;
-        writer.write_val(&self.event().bits())?;
-        writer.write_val(&self.cookie())?;
-        writer.write_val(&self.name_len())?;
-        total_size += size_of::<InotifyEventHeader>();
-
-        if let Some(name) = self.name.as_ref() {
-            // Write the actual name bytes
-            for byte in name.as_bytes() {
-                writer.write_val(byte)?;
-            }
-            // Write null terminator
-            writer.write_val(&b'\0')?;
-            total_size += name.len() + 1;
-
-            // Fill remaining bytes with zeros for alignment
-            let padding_len = pad_name_len - actual_name_len;
-            if padding_len > 0 {
-                let filled = writer.fill_zeros(padding_len).map_err(|(e, _)| e)?;
-                total_size += filled;
-            }
+        let total_size = self.total_size();
+        if total_size > writer.avail() {
+            return_errno_with_message!(Errno::EINVAL, "the buffer is too small");
         }
 
-        Ok(total_size)
-    }
+        // Write the header.
+        writer.write_val(&self.header)?;
 
-    fn get_size(&self) -> usize {
-        const HEADER_SIZE: usize = size_of::<InotifyEventHeader>(); // 16 bytes
-        let actual_name_len = self.name.as_ref().map_or(0, |name| name.len() + 1);
-        let pad_name_len = Self::round_event_name_len(actual_name_len);
-        HEADER_SIZE + pad_name_len
+        let Some(name) = self.name.as_ref() else {
+            debug_assert_eq!(self.header.name_len, 0);
+            return Ok(total_size);
+        };
+        // Write the actual name bytes.
+        writer.write_fallible(&mut VmReader::from(name.as_bytes()).to_fallible())?;
+        // Fill remaining bytes with zeros for alignment.
+        // Note that this also includes the null terminator.
+        writer.fill_zeros((self.header.name_len as usize) - name.len())?;
+
+        Ok(total_size)
     }
 }
 
 bitflags! {
-    /// InotifyEvents represents the set of events that a subscriber wants to monitor.
+    /// Represents the set of events that a subscriber wants to monitor.
+    ///
     /// These events are used to filter notifications sent to the subscriber.
     pub struct InotifyEvents: u32 {
         const ACCESS        = 1 << 0;  // File was accessed
