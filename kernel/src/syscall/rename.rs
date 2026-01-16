@@ -4,7 +4,7 @@ use super::SyscallReturn;
 use crate::{
     fs::{
         file_table::FileDesc,
-        fs_resolver::{AT_FDCWD, FsPath, SplitPath},
+        path::{AT_FDCWD, FsPath, SplitPath},
         utils::InodeType,
     },
     prelude::*,
@@ -36,15 +36,15 @@ pub fn sys_renameat2(
     }
 
     let fs_ref = ctx.thread_local.borrow_fs();
-    let fs = fs_ref.resolver().read();
+    let path_resolver = fs_ref.resolver().read();
 
     let old_path_name = old_path_name.to_string_lossy();
     let (old_dir_path, old_name) = {
         let (old_parent_path_name, old_name) = old_path_name.split_dirname_and_basename()?;
         let old_fs_path = FsPath::from_fd_and_path(old_dirfd, old_parent_path_name)?;
-        (fs.lookup(&old_fs_path)?, old_name)
+        (path_resolver.lookup(&old_fs_path)?, old_name)
     };
-    let old_path = old_dir_path.lookup(old_name)?;
+    let old_path = path_resolver.lookup_at_path(&old_dir_path, old_name)?;
     if old_path.type_() != InodeType::Dir && old_path_name.ends_with('/') {
         return_errno_with_message!(Errno::ENOTDIR, "the old path is not a directory");
     }
@@ -56,12 +56,14 @@ pub fn sys_renameat2(
         }
         let (new_parent_path_name, new_name) = new_path_name.split_dirname_and_basename()?;
         let new_fs_path = FsPath::from_fd_and_path(new_dirfd, new_parent_path_name)?;
-        (fs.lookup(&new_fs_path)?, new_name)
+        (path_resolver.lookup(&new_fs_path)?, new_name)
     };
 
     // Check the absolute path
-    let old_abs_path = old_path.abs_path();
-    let new_abs_path = new_dir_path.abs_path() + "/" + new_name;
+    // FIXME: Using string prefix matching to check for path containment is incorrect.
+    // It doesn't handle path components like '..' or '.' properly.
+    let old_abs_path = path_resolver.make_abs_path(&old_path).into_string();
+    let new_abs_path = path_resolver.make_abs_path(&new_dir_path).into_string() + "/" + new_name;
     if new_abs_path.starts_with(&old_abs_path) {
         if new_abs_path.len() == old_abs_path.len() {
             return Ok(SyscallReturn::Return(0));

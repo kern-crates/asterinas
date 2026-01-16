@@ -5,8 +5,7 @@ use device_id::DeviceId;
 use super::inode_handle::FileIo;
 use crate::{
     fs::{
-        fs_resolver::{FsPath, FsResolver},
-        path::Path,
+        path::{FsPath, Path, PathResolver},
         utils::{InodeType, MknodType, mkmod},
     },
     prelude::*,
@@ -55,9 +54,9 @@ pub fn add_node(
     dev_type: DeviceType,
     dev_id: u64,
     path: &str,
-    fs_resolver: &FsResolver,
+    path_resolver: &PathResolver,
 ) -> Result<Path> {
-    let mut dev_path = fs_resolver.lookup(&FsPath::try_from("/dev").unwrap())?;
+    let mut dev_path = path_resolver.lookup(&FsPath::try_from("/dev").unwrap())?;
     let mut relative_path = {
         let relative_path = path.trim_start_matches('/');
         if relative_path.is_empty() {
@@ -74,7 +73,7 @@ pub fn add_node(
             (relative_path, "")
         };
 
-        match dev_path.lookup(next_name) {
+        match path_resolver.lookup_at_path(&dev_path, next_name) {
             Ok(next_path) => {
                 if path_remain.is_empty() {
                     return_errno_with_message!(Errno::EEXIST, "the device node already exists");

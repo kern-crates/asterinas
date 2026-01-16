@@ -10,7 +10,10 @@ use ostd::{
 
 use super::process_vm::activate_vmar;
 use crate::{
-    fs::{path::Path, utils::Inode},
+    fs::{
+        path::{Path, PathResolver},
+        utils::Inode,
+    },
     prelude::*,
     process::{
         ContextUnshareAdminApi, Credentials, Process,
@@ -40,22 +43,23 @@ pub fn do_execve(
     // of all strings to enforce a sensible overall limit.
     let argv = read_cstring_vec(argv_ptr_ptr, MAX_NR_STRING_ARGS, MAX_LEN_STRING_ARG, ctx)?;
     let envp = read_cstring_vec(envp_ptr_ptr, MAX_NR_STRING_ARGS, MAX_LEN_STRING_ARG, ctx)?;
+
+    let fs_ref = ctx.thread_local.borrow_fs();
+    let path_resolver = fs_ref.resolver().read();
+
     debug!(
-        "filename: {:?}, argv = {:?}, envp = {:?}",
-        elf_file.abs_path(),
+        "file path: {:?}, argv = {:?}, envp = {:?}",
+        path_resolver.make_abs_path(&elf_file).into_string(),
         argv,
         envp
     );
 
-    let fs_ref = ctx.thread_local.borrow_fs();
-    let fs_resolver = fs_ref.resolver().read();
-
     let elf_inode = elf_file.inode();
     let program_to_load =
-        ProgramToLoad::build_from_inode(elf_inode.clone(), &fs_resolver, argv, envp)?;
+        ProgramToLoad::build_from_inode(elf_inode.clone(), &path_resolver, argv, envp)?;
 
     let new_vmar = Vmar::new(ProcessVm::new(elf_file.clone()));
-    let elf_load_info = program_to_load.load_to_vmar(new_vmar.as_ref(), &fs_resolver)?;
+    let elf_load_info = program_to_load.load_to_vmar(new_vmar.as_ref(), &path_resolver)?;
 
     // Ensure no other thread is concurrently performing exit_group or execve.
     // If such an operation is in progress, return EAGAIN.
@@ -75,7 +79,14 @@ pub fn do_execve(
     // After this point, failures in subsequent operations are fatal: the process
     // state may be left inconsistent and it can never return to user mode.
 
-    let res = do_execve_no_return(ctx, user_context, elf_file, new_vmar, &elf_load_info);
+    let res = do_execve_no_return(
+        ctx,
+        user_context,
+        &path_resolver,
+        elf_file,
+        new_vmar,
+        &elf_load_info,
+    );
 
     if res.is_err() {
         ctx.posix_thread
@@ -128,6 +139,7 @@ fn read_cstring_vec(
 fn do_execve_no_return(
     ctx: &Context,
     user_context: &mut UserContext,
+    path_resolver: &PathResolver,
     elf_file: Path,
     new_vmar: Arc<Vmar>,
     elf_load_info: &ElfLoadInfo,
@@ -165,7 +177,7 @@ fn do_execve_no_return(
     unshare_and_close_files(ctx);
 
     // Update the process's executable path and set the thread name
-    let executable_path = elf_file.abs_path();
+    let executable_path = path_resolver.make_abs_path(&elf_file).into_string();
     *posix_thread.thread_name().lock() = ThreadName::new_from_executable_path(&executable_path);
 
     // Unshare and reset signal dispositions to their default actions.

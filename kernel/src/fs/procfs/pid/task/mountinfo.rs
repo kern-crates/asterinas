@@ -29,9 +29,8 @@ impl FileOps for MountInfoFileOps {
         let posix_thread = thread.as_posix_thread().unwrap();
 
         let fs = posix_thread.read_fs();
-        let fs_resolver = fs.resolver().read();
-        let root_mount = fs_resolver.root().mount_node();
+        let path_resolver = fs.resolver().read();
 
-        root_mount.read_mount_info(offset, writer)
+        path_resolver.read_mount_info(offset, writer)
     }
 }

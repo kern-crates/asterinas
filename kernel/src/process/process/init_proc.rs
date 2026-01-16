@@ -7,8 +7,7 @@ use ostd::{arch::cpu::context::UserContext, task::Task, user::UserContextApi};
 use super::Process;
 use crate::{
     fs::{
-        fs_resolver::FsPath,
-        path::{MountNamespace, Path},
+        path::{FsPath, MountNamespace, Path},
         thread_info::ThreadFsInfo,
     },
     prelude::*,
@@ -49,7 +48,7 @@ fn create_init_process(
     envp: Vec<CString>,
 ) -> Result<Arc<Process>> {
     let fs = {
-        let fs_resolver = MountNamespace::get_init_singleton().new_fs_resolver();
+        let fs_resolver = MountNamespace::get_init_singleton().new_path_resolver();
         ThreadFsInfo::new(fs_resolver)
     };
     let fs_path = FsPath::try_from(executable_path)?;
@@ -107,18 +106,23 @@ fn create_init_task(
 ) -> Result<Arc<Task>> {
     let credentials = Credentials::new_root();
 
-    let elf_load_info = {
-        let fs_resolver = fs.resolver().read();
+    let (elf_load_info, elf_abs_path) = {
+        let path_resolver = fs.resolver().read();
+
         let program_to_load =
-            ProgramToLoad::build_from_inode(elf_path.inode().clone(), &fs_resolver, argv, envp)?;
+            ProgramToLoad::build_from_inode(elf_path.inode().clone(), &path_resolver, argv, envp)?;
         let vmar = process.lock_vmar();
-        program_to_load.load_to_vmar(vmar.unwrap(), &fs_resolver)?
+        let elf_load_info = program_to_load.load_to_vmar(vmar.unwrap(), &path_resolver)?;
+        let elf_abs_path = path_resolver.make_abs_path(&elf_path).into_string();
+
+        (elf_load_info, elf_abs_path)
     };
+
     let mut user_ctx = UserContext::default();
     user_ctx.set_instruction_pointer(elf_load_info.entry_point as _);
     user_ctx.set_stack_pointer(elf_load_info.user_stack_top as _);
 
-    let thread_name = ThreadName::new_from_executable_path(&elf_path.abs_path());
+    let thread_name = ThreadName::new_from_executable_path(&elf_abs_path);
 
     let thread_builder = PosixThreadBuilder::new(tid, thread_name, Box::new(user_ctx), credentials)
         .process(Arc::downgrade(process))
