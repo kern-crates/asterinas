@@ -20,6 +20,7 @@ use super::{
     task_set::TaskSet,
 };
 use crate::{
+    events::IoEvents,
     fs::cgroupfs::CgroupNode,
     prelude::*,
     process::{
@@ -149,6 +150,12 @@ pub struct Process {
     // Namespaces
     /// The user namespace
     user_ns: Mutex<Arc<UserNamespace>>,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        self.pidfile_pollee.notify(IoEvents::HUP);
+    }
 }
 
 /// Representing a parent process by holding a weak reference to it and its PID.
@@ -379,13 +386,6 @@ impl Process {
         let mut session_table_mut = process_table::session_table_mut();
         let mut group_table_mut = process_table::group_table_mut();
 
-        if session_table_mut.contains_key(&self.pid) {
-            // FIXME: According to the Linux implementation, this check should be removed, so we'll
-            // return `EPERM` due to hitting the following check. However, we need to work around a
-            // gVisor bug. The upstream gVisor has fixed the issue in:
-            // <https://github.com/google/gvisor/commit/582f7bf6c0ccccaeb1215a232709df38d5d409f7>.
-            return Ok(self.pid);
-        }
         if group_table_mut.contains_key(&self.pid) {
             return_errno_with_message!(
                 Errno::EPERM,
