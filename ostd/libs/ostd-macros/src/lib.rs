@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_span)]
 
-use proc_macro::TokenStream;
+use proc_macro::{Diagnostic, Level, Span, TokenStream};
 use quote::quote;
 use rand::{Rng, distr::Alphanumeric};
 use syn::{Expr, Ident, ItemFn, parse_macro_input};
 
 /// A macro attribute to mark the kernel entry point.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```ignore
-/// #![no_std]
-///
 /// use ostd::prelude::*;
 ///
 /// #[ostd::main]
@@ -29,12 +28,12 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     quote!(
         #[cfg(not(ktest))]
         // SAFETY: The name does not collide with other symbols.
-    #[unsafe(no_mangle)]
+        #[unsafe(no_mangle)]
         extern "Rust" fn __ostd_main() -> ! {
             let _: () = #main_fn_name();
 
-            ostd::task::Task::yield_now();
-            unreachable!("`yield_now` in the boot context should not return");
+            ::ostd::task::Task::yield_now();
+            ::core::unreachable!("`yield_now` in the boot context should not return");
         }
 
         #[expect(unused)]
@@ -43,10 +42,11 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-/// A macro attribute for the unit test kernel entry point.
+/// A macro attribute to mark the unit test kernel entry point.
 ///
 /// This macro is used for internal OSDK implementation. Do not use it
 /// directly.
+#[doc(hidden)]
 #[proc_macro_attribute]
 pub fn test_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let main_fn = parse_macro_input!(item as ItemFn);
@@ -54,12 +54,12 @@ pub fn test_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     quote!(
         // SAFETY: The name does not collide with other symbols.
-    #[unsafe(no_mangle)]
+        #[unsafe(no_mangle)]
         extern "Rust" fn __ostd_main() -> ! {
             let _: () = #main_fn_name();
 
-            ostd::task::Task::yield_now();
-            unreachable!("`yield_now` in the boot context should not return");
+            ::ostd::task::Task::yield_now();
+            ::core::unreachable!("`yield_now` in the boot context should not return");
         }
 
         #main_fn
@@ -72,7 +72,7 @@ pub fn test_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// The attributed static variable will be used to provide frame allocation
 /// for the kernel.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```ignore
 /// use core::alloc::Layout;
@@ -94,13 +94,16 @@ pub fn test_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn global_frame_allocator(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Make a `static __GLOBAL_FRAME_ALLOCATOR_REF: &'static dyn GlobalFrameAllocator`
     // That points to the annotated static variable.
+
     let item = parse_macro_input!(item as syn::ItemStatic);
     let static_name = &item.ident;
 
     quote!(
         // SAFETY: The name does not collide with other symbols.
-    #[unsafe(no_mangle)]
-        static __GLOBAL_FRAME_ALLOCATOR_REF: &'static dyn ostd::mm::frame::GlobalFrameAllocator = &#static_name;
+        #[unsafe(no_mangle)]
+        static __GLOBAL_FRAME_ALLOCATOR_REF: &'static dyn ::ostd::mm::frame::GlobalFrameAllocator =
+            &#static_name;
+
         #item
     )
     .into()
@@ -118,7 +121,7 @@ pub fn global_frame_allocator(_attr: TokenStream, item: TokenStream) -> TokenStr
 /// implement an unsafe trait. [`macro@global_heap_allocator`] eventually relies on
 /// [`global_allocator`] to customize Rust's heap allocator.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```ignore
 /// use core::alloc::{AllocError, Layout};
@@ -140,13 +143,16 @@ pub fn global_frame_allocator(_attr: TokenStream, item: TokenStream) -> TokenStr
 pub fn global_heap_allocator(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Make a `static __GLOBAL_HEAP_ALLOCATOR_REF: &'static dyn GlobalHeapAllocator`
     // That points to the annotated static variable.
+
     let item = parse_macro_input!(item as syn::ItemStatic);
     let static_name = &item.ident;
 
     quote!(
         // SAFETY: The name does not collide with other symbols.
-    #[unsafe(no_mangle)]
-        static __GLOBAL_HEAP_ALLOCATOR_REF: &'static dyn ostd::mm::heap::GlobalHeapAllocator = &#static_name;
+        #[unsafe(no_mangle)]
+        static __GLOBAL_HEAP_ALLOCATOR_REF: &'static dyn ::ostd::mm::heap::GlobalHeapAllocator =
+            &#static_name;
+
         #item
     )
     .into()
@@ -170,9 +176,12 @@ pub fn global_heap_allocator(_attr: TokenStream, item: TokenStream) -> TokenStre
 #[proc_macro_attribute]
 pub fn global_heap_allocator_slot_map(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Rewrite the input `const fn __any_name__(layout: Layout) -> Option<SlotInfo> { ... }` to
-    // `const extern "Rust" fn __GLOBAL_HEAP_SLOT_INFO_FROM_LAYOUT(layout: Layout) -> Option<SlotInfo> { ... }`.
-    // Reject if the input is not a `const fn`.
+    // `const extern "Rust" fn __global_heap_slot_info_from_layout(layout: Layout) -> Option<SlotInfo> { ... }`.
+
     let item = parse_macro_input!(item as syn::ItemFn);
+    let fn_name = &item.sig.ident;
+
+    // Reject if the input is not a `const fn`.
     assert!(
         item.sig.constness.is_some(),
         "the annotated function must be `const`"
@@ -180,7 +189,13 @@ pub fn global_heap_allocator_slot_map(_attr: TokenStream, item: TokenStream) -> 
 
     quote!(
         /// SAFETY: The name does not collide with other symbols.
-        #[unsafe(export_name = "__GLOBAL_HEAP_SLOT_INFO_FROM_LAYOUT")]
+        #[unsafe(no_mangle)]
+        const extern "Rust" fn __global_heap_slot_info_from_layout(
+            layout: ::core::alloc::Layout,
+        ) -> ::core::option::Option<::ostd::mm::heap::SlotInfo> {
+            #fn_name(layout)
+        }
+
         #item
     )
     .into()
@@ -199,8 +214,8 @@ pub fn panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     quote!(
         #[cfg(not(ktest))]
         // SAFETY: The name does not collide with other symbols.
-    #[unsafe(no_mangle)]
-        extern "Rust" fn __ostd_panic_handler(info: &core::panic::PanicInfo) -> ! {
+        #[unsafe(no_mangle)]
+        extern "Rust" fn __ostd_panic_handler(info: &::core::panic::PanicInfo) -> ! {
             #handler_fn_name(info);
         }
 
@@ -210,10 +225,11 @@ pub fn panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-/// A macro attribute for the panic handler.
+/// A macro attribute for the unit test panic handler.
 ///
 /// This macro is used for internal OSDK implementation. Do not use it
 /// directly.
+#[doc(hidden)]
 #[proc_macro_attribute]
 pub fn test_panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let handler_fn = parse_macro_input!(item as ItemFn);
@@ -221,8 +237,8 @@ pub fn test_panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream 
 
     quote!(
         // SAFETY: The name does not collide with other symbols.
-    #[unsafe(no_mangle)]
-        extern "Rust" fn __ostd_panic_handler(info: &core::panic::PanicInfo) -> ! {
+        #[unsafe(no_mangle)]
+        extern "Rust" fn __ostd_panic_handler(info: &::core::panic::PanicInfo) -> ! {
             #handler_fn_name(info);
         }
 
@@ -233,9 +249,9 @@ pub fn test_panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream 
 
 /// The test attribute macro to mark a test function.
 ///
-/// # Example
+/// # Examples
 ///
-/// For crates other than ostd,
+/// For crates other than `ostd`,
 /// this macro can be used in the following form.
 ///
 /// ```ignore
@@ -247,7 +263,7 @@ pub fn test_panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream 
 /// }
 /// ```
 ///
-/// For ostd crate itself,
+/// For `ostd` crate itself,
 /// this macro can be used in the form
 ///
 /// ```ignore
@@ -259,16 +275,16 @@ pub fn test_panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream 
 /// }
 /// ```
 #[proc_macro_attribute]
-pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn ktest(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Assuming that the item has type `fn() -> ()`, otherwise panics.
     let input = parse_macro_input!(item as ItemFn);
     assert!(
         input.sig.inputs.is_empty(),
-        "ostd::test function should have no arguments"
+        "test functions should have no arguments"
     );
     assert!(
         matches!(input.sig.output, syn::ReturnType::Default),
-        "ostd::test function should return `()`"
+        "test functions should return `()`"
     );
 
     // Generate a random identifier to avoid name conflicts.
@@ -284,47 +300,11 @@ pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
         proc_macro2::Span::call_site(),
     );
 
-    let is_should_panic_attr = |attr: &&syn::Attribute| {
-        attr.path()
-            .segments
-            .iter()
-            .any(|segment| segment.ident == "should_panic")
-    };
-    let mut attr_iter = input.attrs.iter();
-    let should_panic = attr_iter.find(is_should_panic_attr);
-    let (should_panic, expectation) = match should_panic {
-        Some(attr) => {
-            assert!(
-                !attr_iter.any(|attr: &syn::Attribute| is_should_panic_attr(&attr)),
-                "multiple `should_panic` attributes"
-            );
-            match &attr.meta {
-                syn::Meta::List(l) => {
-                    let arg_err_message = "`should_panic` attribute should only have zero or one `expected` argument, with the format of `expected = \"<panic message>\"`";
-                    let expected_assign =
-                        syn::parse2::<syn::ExprAssign>(l.tokens.clone()).expect(arg_err_message);
-                    let Expr::Lit(s) = *expected_assign.right else {
-                        panic!("{}", arg_err_message);
-                    };
-                    let syn::Lit::Str(expectation) = s.lit else {
-                        panic!("{}", arg_err_message);
-                    };
-                    (true, Some(expectation))
-                }
-                _ => (true, None),
-            }
-        }
-        None => (false, None),
-    };
-    let expectation_tokens = if let Some(s) = expectation {
-        quote! {
-            Some(#s)
-        }
-    } else {
-        quote! {
-            None
-        }
-    };
+    // Emit warnings similar to `clippy::redundant_test_prefix`.
+    emit_redundant_test_prefix_warnings(attr, &input.sig.ident);
+
+    // Deal with `#[should_panic]`.
+    let panic_expectation_tokens = generate_panic_expectation_tokens(&input.attrs);
 
     let package_name = std::env::var("CARGO_PKG_NAME").unwrap();
     let span = proc_macro2::Span::call_site();
@@ -337,14 +317,14 @@ pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #[used]
             // SAFETY: This is properly handled in the linker script.
             #[unsafe(link_section = ".ktest_array")]
-            static #fn_ktest_item_name: ostd_test::KtestItem = ostd_test::KtestItem::new(
+            static #fn_ktest_item_name: ::ostd_test::KtestItem = ::ostd_test::KtestItem::new(
                 #fn_name,
-                (#should_panic, #expectation_tokens),
-                ostd_test::KtestItemInfo {
-                    module_path: module_path!(),
-                    fn_name: stringify!(#fn_name),
+                #panic_expectation_tokens,
+                ::ostd_test::KtestItemInfo {
+                    module_path: ::core::module_path!(),
+                    fn_name: ::core::stringify!(#fn_name),
                     package: #package_name,
-                    source: file!(),
+                    source: ::core::file!(),
                     line: #line,
                     col: #col,
                 },
@@ -356,14 +336,14 @@ pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #[used]
             // SAFETY: This is properly handled in the linker script.
             #[unsafe(link_section = ".ktest_array")]
-            static #fn_ktest_item_name: ostd::ktest::KtestItem = ostd::ktest::KtestItem::new(
+            static #fn_ktest_item_name: ::ostd::ktest::KtestItem = ::ostd::ktest::KtestItem::new(
                 #fn_name,
-                (#should_panic, #expectation_tokens),
-                ostd::ktest::KtestItemInfo {
-                    module_path: module_path!(),
-                    fn_name: stringify!(#fn_name),
+                #panic_expectation_tokens,
+                ::ostd::ktest::KtestItemInfo {
+                    module_path: ::core::module_path!(),
+                    fn_name: ::core::stringify!(#fn_name),
                     package: #package_name,
-                    source: file!(),
+                    source: ::core::file!(),
                     line: #line,
                     col: #col,
                 },
@@ -378,4 +358,130 @@ pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(output)
+}
+
+fn emit_redundant_test_prefix_warnings(attr: TokenStream, ident: &Ident) {
+    let should_have_test_prefix = if !attr.is_empty() {
+        // This is an equivalent of `#[expect(clippy::redundant_test_prefix)]`.
+        assert_eq!(
+            attr.to_string(),
+            "expect_redundant_test_prefix",
+            "unknown arguments"
+        );
+        true
+    } else {
+        false
+    };
+
+    fn should_deny_warnings(rustflags: &str) -> bool {
+        let options = rustflags.split_whitespace().collect::<Vec<_>>();
+
+        if options.is_empty() {
+            return false;
+        }
+
+        if options.contains(&"-Dwarnings") {
+            return true;
+        }
+
+        for i in 0..options.len() - 1 {
+            if (options[i] == "--deny" || options[i] == "-D") && options[i + 1] == "warnings" {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    // FIXME: `-Dwarnings` cannot automatically convert warnings generated from procedural macros
+    // into errors. So we do this manually. Remove this workaround when the upstream changes
+    // resolve the issue (see <https://github.com/rust-lang/rust/pull/135432>).
+    let lint_level = if let Ok(rustflags) = std::env::var("RUSTFLAGS")
+        && should_deny_warnings(rustflags.as_str())
+    {
+        Level::Error
+    } else {
+        Level::Warning
+    };
+
+    let test_prefix_stripped = ident
+        .to_string()
+        .strip_prefix("test_")
+        .map(ToOwned::to_owned);
+
+    if !should_have_test_prefix && let Some(name_to_suggest) = test_prefix_stripped {
+        Diagnostic::spanned(
+            ident.span().unwrap(),
+            lint_level,
+            "redundant `test_` prefix in test function name",
+        )
+        .span_help(
+            ident.span().unwrap(),
+            format!(
+                "consider removing the `test_` prefix: `{}`",
+                name_to_suggest
+            ),
+        )
+        .span_help(
+            Span::call_site(),
+            "consider allowing the lint: `#[ktest(expect_redundant_test_prefix)]`",
+        )
+        .help(
+            "for further information visit \
+             https://rust-lang.github.io/rust-clippy/master/index.html#redundant_test_prefix",
+        )
+        .emit()
+    } else if should_have_test_prefix && test_prefix_stripped.is_none() {
+        Diagnostic::spanned(
+            ident.span().unwrap(),
+            lint_level,
+            "no redundant `test_` prefix in test function name",
+        )
+        .span_help(
+            Span::call_site(),
+            "consider removing the expectation: `#[ktest]`",
+        )
+        .emit();
+    };
+}
+
+fn generate_panic_expectation_tokens(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
+    fn is_should_panic_attr(attr: &syn::Attribute) -> bool {
+        attr.path()
+            .segments
+            .iter()
+            .any(|segment| segment.ident == "should_panic")
+    }
+
+    let mut attr_iter = attrs.iter();
+    let Some(should_panic_attr) = attr_iter.find(|&attr| is_should_panic_attr(attr)) else {
+        let tokens = quote! { (false, None) };
+        return tokens;
+    };
+    assert!(
+        !attr_iter.any(is_should_panic_attr),
+        "multiple `should_panic` attributes"
+    );
+
+    match &should_panic_attr.meta {
+        syn::Meta::List(list) => {
+            if let Ok(expected_assign) = syn::parse2::<syn::ExprAssign>(list.tokens.clone())
+                && let Expr::Lit(lit) = *expected_assign.right
+                && let syn::Lit::Str(expectation) = lit.lit
+            {
+                let tokens = quote! { (true, Some(#expectation)) };
+                return tokens;
+            }
+        }
+        syn::Meta::Path(_) => {
+            let tokens = quote! { (true, None) };
+            return tokens;
+        }
+        _ => (),
+    }
+
+    panic!(
+        "`should_panic` attributes should only have zero or one `expected` argument, \
+         with the format of `expected = \"<panic message>\"`"
+    );
 }
